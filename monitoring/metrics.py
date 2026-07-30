@@ -1,181 +1,124 @@
-"""
-monitoring/metrics.py
-
-Exporteur Prometheus custom pour le data lake.
-
-Ne remplace PAS Node Exporter (CPU/RAM/disque, géré par Personne A) :
-expose des métriques MÉTIER lues dans PostgreSQL (batch_lineage, quality_metrics) :
-  - nombre de records traités par couche/job
-  - durée des jobs
-  - taux de succès
-  - métriques de qualité (nulls, doublons, invalides) par dataset
-
-Répond à l'exigence "Opérations par couche" + "Logs de transformation"
-(section Monitoring & Observabilité du sujet).
-
-Lancement (indépendant des jobs Spark, tourne en continu) :
-  python3 monitoring/metrics.py
-
-A ajouter par Personne A dans prometheus/prometheus.yml :
-  - job_name: "datalake-custom-metrics"
-    static_configs:
-      - targets: ["custom-metrics:9200"]
-"""
-
 import os
-import sys
 import time
+from pathlib import Path
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 import psycopg2
-import psycopg2.extras
-from prometheus_client import start_http_server, Gauge
 
-POLL_INTERVAL_SECONDS = int(os.environ.get("METRICS_POLL_INTERVAL_SECONDS", "30"))
-METRICS_PORT = int(os.environ.get("METRICS_EXPORTER_PORT", "9200"))
+POSTGRES_HOST     = os.getenv("POSTGRES_HOST",     "postgres")
+POSTGRES_PORT     = os.getenv("POSTGRES_PORT",     "5432")
+POSTGRES_DB       = os.getenv("POSTGRES_DB",       "crypto_gold")
+POSTGRES_USER     = os.getenv("POSTGRES_USER",     "crypto")
+POSTGRES_PASSWORD = os.getenv("POSTGRES_PASSWORD", "crypto123")
+METRICS_PORT      = int(os.getenv("METRICS_PORT",  "8000"))
 
-# ============================================
-# Config Postgres depuis l'environnement
-# ============================================
-def get_pg_config():
-    required = ["POSTGRES_HOST", "POSTGRES_PORT", "POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD"]
-    missing = [k for k in required if not os.environ.get(k)]
-    if missing:
-        print(f"ERREUR: variables d'environnement manquantes: {missing}")
-        sys.exit(1)
-    return {
-        "host": os.environ["POSTGRES_HOST"],
-        "port": os.environ["POSTGRES_PORT"],
-        "dbname": os.environ["POSTGRES_DB"],
-        "user": os.environ["POSTGRES_USER"],
-        "password": os.environ["POSTGRES_PASSWORD"],
-    }
+BRONZE_PATH = Path("/work/data/bronze")
 
 
-# ============================================
-# Métriques Prometheus exposées
-# ============================================
-records_processed = Gauge(
-    "datalake_records_processed",
-    "Nombre de records traités lors du dernier batch",
-    ["layer", "job_name"],
-)
-job_duration_seconds = Gauge(
-    "datalake_job_duration_seconds",
-    "Durée du dernier batch en secondes",
-    ["layer", "job_name"],
-)
-job_success_ratio = Gauge(
-    "datalake_job_success_ratio",
-    "Ratio de succès des N derniers batches (0 à 1)",
-    ["layer", "job_name"],
-)
-job_last_status = Gauge(
-    "datalake_job_last_status",
-    "Statut du dernier batch (1=success, 0=failed, 0.5=running)",
-    ["layer", "job_name"],
-)
-quality_null_count = Gauge(
-    "datalake_quality_null_count",
-    "Nombre de valeurs nulles détectées (dernier contrôle qualité)",
-    ["dataset_name"],
-)
-quality_duplicate_count = Gauge(
-    "datalake_quality_duplicate_count",
-    "Nombre de doublons détectés (dernier contrôle qualité)",
-    ["dataset_name"],
-)
-quality_invalid_count = Gauge(
-    "datalake_quality_invalid_count",
-    "Nombre de records invalides détectés (dernier contrôle qualité)",
-    ["dataset_name"],
-)
+def count_bronze_files() -> dict:
+    result = {}
+    for subdir in ["ohlcv", "news", "coingecko"]:
+        path = BRONZE_PATH / subdir
+        if path.exists():
+            files = list(path.rglob("*"))
+            result[subdir] = {
+                "files": len([f for f in files if f.is_file()]),
+                "size_bytes": sum(f.stat().st_size for f in files if f.is_file()),
+            }
+        else:
+            result[subdir] = {"files": 0, "size_bytes": 0}
+    return result
 
 
-# ============================================
-# Requêtes de collecte
-# ============================================
-def fetch_latest_batch_per_job(conn):
-    """Un batch le plus récent par (layer, job_name)."""
-    query = """
-        SELECT DISTINCT ON (layer, job_name)
-            layer, job_name, status, records_in, records_out,
-            EXTRACT(EPOCH FROM (COALESCE(finished_at, NOW()) - started_at)) AS duration_seconds
-        FROM batch_lineage
-        ORDER BY layer, job_name, started_at DESC
-    """
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(query)
-        return cur.fetchall()
+def get_postgres_metrics() -> dict:
+    try:
+        conn = psycopg2.connect(
+            host=POSTGRES_HOST, port=int(POSTGRES_PORT),
+            dbname=POSTGRES_DB, user=POSTGRES_USER,
+            password=POSTGRES_PASSWORD,
+        )
+        cur = conn.cursor()
+
+        counts = {}
+        for table in ["daily_market_kpi", "sentiment_daily_kpi",
+                      "price_prediction_result", "correlation_insight",
+                      "pipeline_metrics"]:
+            cur.execute(f"SELECT COUNT(*) FROM {table}")
+            counts[table] = cur.fetchone()[0]
+
+        cur.execute(
+            "SELECT layer, AVG(duration_s), SUM(rows_in), SUM(rows_out) "
+            "FROM pipeline_metrics GROUP BY layer"
+        )
+        pipeline = cur.fetchall()
+
+        cur.close()
+        conn.close()
+        return {"counts": counts, "pipeline": pipeline, "error": None}
+
+    except Exception as e:
+        return {"counts": {}, "pipeline": [], "error": str(e)}
 
 
-def fetch_success_ratio_per_job(conn, window=20):
-    """Ratio de succès sur les `window` derniers batches par (layer, job_name)."""
-    query = """
-        SELECT layer, job_name,
-               AVG(CASE WHEN status = 'success' THEN 1.0 ELSE 0.0 END) AS ratio
-        FROM (
-            SELECT layer, job_name, status,
-                   ROW_NUMBER() OVER (PARTITION BY layer, job_name ORDER BY started_at DESC) AS rn
-            FROM batch_lineage
-            WHERE status IN ('success', 'failed')
-        ) t
-        WHERE rn <= %s
-        GROUP BY layer, job_name
-    """
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(query, (window,))
-        return cur.fetchall()
+def build_metrics() -> str:
+    lines = []
+
+    # Metriques Bronze
+    bronze = count_bronze_files()
+    lines.append("# HELP bronze_file_count Nombre de fichiers par sous-couche Bronze")
+    lines.append("# TYPE bronze_file_count gauge")
+    lines.append("# HELP bronze_size_bytes Taille en bytes par sous-couche Bronze")
+    lines.append("# TYPE bronze_size_bytes gauge")
+    for subdir, info in bronze.items():
+        lines.append(f'bronze_file_count{{layer="{subdir}"}} {info["files"]}')
+        lines.append(f'bronze_size_bytes{{layer="{subdir}"}} {info["size_bytes"]}')
+
+    # Metriques Gold PostgreSQL
+    pg = get_postgres_metrics()
+    if pg["error"] is None:
+        lines.append("# HELP gold_table_rows Nombre de lignes par table Gold")
+        lines.append("# TYPE gold_table_rows gauge")
+        for table, count in pg["counts"].items():
+            lines.append(f'gold_table_rows{{table="{table}"}} {count}')
+
+        lines.append("# HELP pipeline_duration_seconds Duree moyenne par couche")
+        lines.append("# TYPE pipeline_duration_seconds gauge")
+        lines.append("# HELP pipeline_rows_in Lignes lues par couche")
+        lines.append("# TYPE pipeline_rows_in gauge")
+        lines.append("# HELP pipeline_rows_out Lignes produites par couche")
+        lines.append("# TYPE pipeline_rows_out gauge")
+        for layer, avg_dur, rows_in, rows_out in pg["pipeline"]:
+            lines.append(f'pipeline_duration_seconds{{layer="{layer}"}} {round(avg_dur, 2)}')
+            lines.append(f'pipeline_rows_in{{layer="{layer}"}} {rows_in}')
+            lines.append(f'pipeline_rows_out{{layer="{layer}"}} {rows_out}')
+    else:
+        lines.append(f"# ERREUR PostgreSQL : {pg['error']}")
+
+    return "\n".join(lines) + "\n"
 
 
-def fetch_latest_quality_metrics(conn):
-    """Dernier contrôle qualité par dataset."""
-    query = """
-        SELECT DISTINCT ON (dataset_name)
-            dataset_name, null_count, invalid_count, duplicate_count
-        FROM quality_metrics
-        ORDER BY dataset_name, checked_at DESC
-    """
-    with conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor) as cur:
-        cur.execute(query)
-        return cur.fetchall()
+class MetricsHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/metrics":
+            body = build_metrics().encode("utf-8")
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        else:
+            self.send_response(404)
+            self.end_headers()
+
+    def log_message(self, format, *args):
+        pass
 
 
-# ============================================
-# Boucle de collecte
-# ============================================
-def collect_once(conn):
-    status_value = {"success": 1.0, "failed": 0.0, "running": 0.5}
-
-    for row in fetch_latest_batch_per_job(conn):
-        labels = {"layer": row["layer"], "job_name": row["job_name"]}
-        records_processed.labels(**labels).set(row["records_out"] or 0)
-        job_duration_seconds.labels(**labels).set(row["duration_seconds"] or 0)
-        job_last_status.labels(**labels).set(status_value.get(row["status"], 0))
-
-    for row in fetch_success_ratio_per_job(conn):
-        job_success_ratio.labels(layer=row["layer"], job_name=row["job_name"]).set(row["ratio"] or 0)
-
-    for row in fetch_latest_quality_metrics(conn):
-        quality_null_count.labels(dataset_name=row["dataset_name"]).set(row["null_count"] or 0)
-        quality_duplicate_count.labels(dataset_name=row["dataset_name"]).set(row["duplicate_count"] or 0)
-        quality_invalid_count.labels(dataset_name=row["dataset_name"]).set(row["invalid_count"] or 0)
-
-
-def main():
-    cfg = get_pg_config()
-    start_http_server(METRICS_PORT)
-    print(f"[metrics] Exporteur Prometheus démarré sur le port {METRICS_PORT}")
-    print(f"[metrics] Poll toutes les {POLL_INTERVAL_SECONDS}s depuis PostgreSQL")
-
-    while True:
-        try:
-            conn = psycopg2.connect(**cfg)
-            collect_once(conn)
-            conn.close()
-        except Exception as e:
-            print(f"[metrics] Erreur de collecte: {e}")
-        time.sleep(POLL_INTERVAL_SECONDS)
+def run():
+    print(f"Serveur de metriques sur http://0.0.0.0:{METRICS_PORT}/metrics")
+    server = HTTPServer(("0.0.0.0", METRICS_PORT), MetricsHandler)
+    server.serve_forever()
 
 
 if __name__ == "__main__":
-    main()
+    run()

@@ -20,3 +20,7 @@ scrape_configs:
     metrics_path: /metrics/master/prometheus/
     static_configs:
       - targets: ["spark-master:8080"]
+
+      - job_name: crypto-metrics
+    static_configs:
+      - targets: ["metrics:8000"]

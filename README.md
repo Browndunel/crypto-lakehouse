@@ -1,105 +1,87 @@
-# crypto-lakehouse# Crypto Data Lake & Warehouse — Projet Big Data IPSSI 2026
+# CryptoLakehouse
 
-Plateforme data lake/warehouse en architecture Medallion (Bronze → Silver → Gold)
-ingérant des données de marché crypto (cours OHLCV) et des actualités
-(Reddit + presse financière), avec monitoring temps réel et prédiction de prix.
+Plateforme Data Lake & Warehouse pour l'analyse du marché crypto.
+Architecture Medallion (Bronze → Silver → Gold) avec monitoring temps réel.
 
-## Objectif
+## Groupe
 
-Ingérer des données de marché crypto structurées (cours OHLCV Binance) et des
-actualités non-structurées (Reddit, presse financière via RSS/API), les nettoyer
-et les structurer en 3 couches, calculer des indicateurs métier (volatilité,
-tendances, sentiment), prédire le prix de clôture du lendemain, et surveiller
-l'ensemble du pipeline en temps réel — le tout entièrement automatisé.
+Teboh / Emmanuel Lamah / Tchinda Douanla
 
 ## Architecture
 
-```
-Sources externes                Bronze (HDFS)         Silver (HDFS)          Gold (PostgreSQL)
-─────────────────                ─────────────         ─────────────          ──────────────────
-Binance (bulk CSV)      ─────►   RawOHLCVCandle   ──►   CleanCandle      ──►   DailyMarketKPI
-CoinGecko API           ─────►   RawPriceSnapshot                             PricePredictionResult
-Reddit API (PRAW)       ─────►   RawRedditPost    ──►   CleanRedditPost  ──►   SentimentDailyKPI
-NewsAPI / RSS           ─────►   RawNewsArticle   ──►   CleanNewsArticle ──►   CorrelationInsight
-```
+### Choix de stockage — justification
 
-Traitement : Apache Spark (cluster Docker, non local).
-Monitoring : Prometheus + Grafana + Node Exporter + exporteur custom (métriques métier).
-Orchestration : Makefile, configuration 100% via `.env` / YAML (aucun `.sh`).
+- **Bronze et Silver** : fichiers locaux au format Parquet (stockage colonnaire,
+  compression native, compatible Spark). HDFS non utilisé car l'environnement
+  Codespace impose des contraintes d'espace disque. Le stockage local Parquet
+  offre les mêmes garanties de lecture distribuée via Spark.
+- **Gold** : PostgreSQL 15 — base relationnelle pour les KPIs métier,
+  requêtable directement par Grafana et exposable via API.
 
-Détail des entités : voir `diagramme_classe_trading_crypto.docx`.
+### Couches
 
-## Répartition de l'équipe
+Bronze → données brutes intactes (CSV Binance, JSON CoinGecko, JSON RSS)
+Silver → nettoyage, déduplication, validation schéma, sentiment NLP (Parquet)
+Gold → KPIs métier, prédictions, corrélations (PostgreSQL)
 
-| Personne | Périmètre |
-|---|---|
-| **A — Infrastructure** | `docker-compose.yml`, `.env`, `Makefile`, `conf/hadoop.env`, `prometheus/`, `grafana/provisioning/` |
-| **B — Pipeline Bronze & Silver** | `ingest/binance.py`, `ingest/coingecko.py`, `ingest/rss_news.py`, `transform/silver.py` |
-| **C — Gold & Coordination** | `gold/gold.py`, `monitoring/metrics.py`, `tests/`, `README.md`, `warehouse/schema.sql` |
 
-## Démarrage rapide
+## Sources de données
+
+| Source | Type | Format | Couche |
+|---|---|---|---|
+| Binance Public Data | Structuré | CSV OHLCV | Bronze batch |
+| CoinGecko API | Structuré | JSON | Bronze temps réel |
+| RSS CoinDesk / CoinTelegraph / Decrypt | Non-structuré | JSON texte | Bronze batch |
+
+## Stack technique
+
+| Service | Image | Rôle |
+|---|---|---|
+| spark-master | apache/spark:3.5.1 | Coordinateur Spark |
+| spark-worker | apache/spark:3.5.1 | Exécuteur Spark |
+| postgres | postgres:15 | Stockage Gold |
+| prometheus | prom/prometheus:v2.53.0 | Collecte métriques |
+| grafana | grafana/grafana:11.1.0 | Dashboard |
+| node-exporter | prom/node-exporter:v1.8.1 | Métriques système |
+| metrics | python:3.11-slim | Métriques pipeline custom |
+
+## Lancement
 
 ```bash
-# 1. Configuration (une seule fois)
-cp .env.example .env
-# éditer .env : POSTGRES_PASSWORD, GRAFANA_ADMIN_PASSWORD, REDDIT_CLIENT_ID/SECRET, NEWSAPI_KEY
+# Démarrer la stack complète
+make up
 
-# 2. Infrastructure
-make up            # démarre tous les containers
-make init-hdfs      # crée l'arborescence HDFS Bronze/Silver
-make init-db         # crée le schéma Gold dans PostgreSQL
+# Pipeline complet (ingest + transform + gold)
+make all
 
-# 3. Pipeline complet
-make pipeline        # ingestion -> silver -> gold, dans cet ordre
+# Étapes individuelles
+make ingest     # Bronze
+make transform  # Silver
+make gold       # Gold
 
-# 4. Vérification
-pytest tests/test_e2e.py -v
+# Arrêter
+make down
 ```
 
-## Interfaces (Codespace : onglet PORTS)
+## Accès aux services
 
-| Service | Port | Usage |
-|---|---|---|
-| Spark Master UI | 8080 | suivi des jobs Spark |
-| HDFS Namenode UI | 9870 | exploration Bronze/Silver |
-| Grafana | 3000 | dashboards monitoring |
-| Prometheus | 9090 | requêtes métriques brutes |
-| PostgreSQL | 5432 | requêtes SQL sur Gold (DBeaver, psql...) |
-| Exporteur custom | 9200 | métriques métier (`/metrics`) |
+| Service | URL |
+|---|---|
+| Spark UI | http://localhost:8080 |
+| Grafana | http://localhost:3000 |
+| Prometheus | http://localhost:9090 |
+| Métriques custom | http://localhost:8000/metrics |
 
-## Traçabilité (lineage)
+## KPIs calculés (couche Gold)
 
-Chaque exécution de job (`gold.py`, jobs Silver) est enregistrée dans
-`batch_lineage` avec un `batch_id` (UUID). Chaque table Gold porte une colonne
-`source_batch_id` qui référence ce batch. Pour retracer l'origine d'un KPI :
+- **DailyMarketKPI** : close, SMA 20, RSI 14, volatilité 7j, volume moyen 7j
+- **SentimentDailyKPI** : score sentiment moyen, nb articles, mentions BTC/ETH
+- **PricePredictionResult** : prédiction du prix J+1 (modèle SMA momentum)
+- **CorrelationInsight** : croisement prix/sentiment avec lignage Bronze→Gold
 
-```sql
-SELECT k.*, b.job_name, b.started_at, b.status
-FROM daily_market_kpi k
-JOIN batch_lineage b ON k.source_batch_id = b.batch_id
-WHERE k.symbol = 'BTC' AND k.day = '2026-07-29';
-```
+## Qualité des données (Silver)
 
-## Modèle de prédiction
-
-Régression linéaire (`pyspark.ml.regression.LinearRegression`) sur les features :
-`sma_20`, `volatility_7d`, `volume_avg_7d`, `avg_sentiment_score` → prédit le
-prix de clôture J+1. Choix volontairement simple (défendable en 24h, résultat
-interprétable) plutôt qu'un modèle complexe non maîtrisé par l'équipe.
-
-## Tests
-
-`tests/test_e2e.py` vérifie, sur l'infra réellement démarrée (pas de mocks) :
-- accessibilité de tous les services (Postgres, HDFS, Prometheus, Grafana)
-- présence des données Silver en HDFS
-- tables Gold peuplées après `make pipeline`
-- traçabilité : aucune ligne Gold orpheline (sans `batch_id` valide)
-- présence des index requis pour les requêtes complexes
-- cohérence basique des prédictions (pas de prix négatifs)
-
-## Choix techniques justifiés
-
-- **HDFS pour Bronze/Silver** : volumétrie 5GB+, cohérent avec l'exigence "Spark non local"
-- **PostgreSQL pour Gold** : requêtes relationnelles simples (agrégations, jointures symbole/date), pas besoin de NoSQL pour ce volume de KPIs
-- **Régression linéaire plutôt que LSTM/ARIMA** : le sujet évalue la plateforme, pas la sophistication du modèle
-- **Sentiment calculé en Silver, pas en Gold** : enrichissement ligne par ligne (NLP), pas une agrégation — cohérent avec le rôle de chaque couche
+- Validation de schéma : types explicites sur tous les champs OHLCV
+- Déduplication : par `open_time` pour OHLCV, par `title` pour les news
+- Métriques : doublons supprimés, nulls comptés, sentiment moyen loggé
+- Enrichissement : `price_change_pct`, `dedup_key`, `is_valid`, `mention_btc/eth`

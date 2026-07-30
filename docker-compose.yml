@@ -89,3 +89,26 @@ services:
       - "3000:3000"
     networks:
       - lakehouse
+
+  metrics:
+    image: python:3.11-slim
+    container_name: metrics
+    working_dir: /work
+    command: >
+      sh -c "pip install psycopg2-binary -q && python monitoring/metrics.py"
+    environment:
+      POSTGRES_HOST: postgres
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: crypto_gold
+      POSTGRES_USER: crypto
+      POSTGRES_PASSWORD: crypto123
+      METRICS_PORT: "8000"
+    volumes:
+      - ./monitoring:/work/monitoring
+      - ./data:/work/data
+    ports:
+      - "8000:8000"
+    depends_on:
+      - postgres
+    networks:
+      - lakehouse
