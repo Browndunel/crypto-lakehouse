@@ -3,3 +3,5 @@ data/
 jars/
 __pycache__/
 *.pyc
+.env
+logs/
