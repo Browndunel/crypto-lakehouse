@@ -23,6 +23,7 @@ transform:
 
 gold:
 	@echo "Calcul Gold..."
+	docker exec -u root spark-master pip install psycopg2-binary -q --no-cache-dir
 	docker exec spark-master /opt/spark/bin/spark-submit \
 		--master spark://spark-master:7077 \
 		--jars /work/jars/postgresql-42.7.3.jar \

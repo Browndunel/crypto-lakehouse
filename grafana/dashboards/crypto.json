@@ -1,0 +1,111 @@
+{
+  "__inputs": [],
+  "__requires": [],
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 0,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "custom": { "lineWidth": 2 } },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "id": 1,
+      "options": { "legend": { "displayMode": "list" }, "tooltip": { "mode": "single" } },
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+          "expr": "rate(node_cpu_seconds_total{mode!=\"idle\"}[1m])",
+          "legendFormat": "CPU {{cpu}} {{mode}}",
+          "refId": "A"
+        }
+      ],
+      "title": "CPU Usage",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "fieldConfig": {
+        "defaults": { "color": { "mode": "palette-classic" }, "unit": "percent" },
+        "overrides": []
+      },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "id": 2,
+      "targets": [
+        {
+          "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+          "expr": "100 - (node_memory_MemAvailable_bytes / node_memory_MemTotal_bytes * 100)",
+          "legendFormat": "Mémoire utilisée %",
+          "refId": "A"
+        }
+      ],
+      "title": "Mémoire utilisée %",
+      "type": "timeseries"
+    },
+    {
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "id": 3,
+      "options": { "footer": { "show": false }, "showHeader": true },
+      "targets": [
+        {
+          "datasource": { "type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C" },
+          "rawSql": "SELECT date, ROUND(AVG(close_day)::numeric,2) AS prix_moyen, ROUND(AVG(sma_20)::numeric,2) AS sma_20, ROUND(AVG(rsi_14)::numeric,2) AS rsi_14 FROM daily_market_kpi GROUP BY date ORDER BY date DESC LIMIT 50",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "title": "Prix crypto + SMA20 + RSI14",
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "id": 4,
+      "options": { "footer": { "show": false }, "showHeader": true },
+      "targets": [
+        {
+          "datasource": { "type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C" },
+          "rawSql": "SELECT prediction_date AS date, ROUND(AVG(predicted_close)::numeric,2) AS prix_predit FROM price_prediction_result GROUP BY prediction_date ORDER BY prediction_date DESC LIMIT 30",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "title": "Prédictions prix J+1",
+      "type": "table"
+    },
+    {
+      "datasource": { "type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C" },
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 16 },
+      "id": 5,
+      "options": { "footer": { "show": false }, "showHeader": true },
+      "targets": [
+        {
+          "datasource": { "type": "grafana-postgresql-datasource", "uid": "PCC52D03280B7034C" },
+          "rawSql": "SELECT layer, rows_in, rows_out, ROUND(duration_s::numeric,2) AS duree_s, processed_at FROM pipeline_metrics ORDER BY processed_at DESC",
+          "format": "table",
+          "refId": "A"
+        }
+      ],
+      "title": "Logs pipeline par couche",
+      "type": "table"
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 38,
+  "tags": ["crypto", "lakehouse"],
+  "time": { "from": "now-1h", "to": "now" },
+  "timepicker": {},
+  "timezone": "browser",
+  "title": "CryptoLakehouse Monitoring",
+  "uid": "crypto-lakehouse-monitoring",
+  "version": 1
+}
